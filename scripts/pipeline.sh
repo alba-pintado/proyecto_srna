@@ -1,59 +1,86 @@
+#!/bin/bash
+set -e  # Stop execution if any command fails
 
-set -e  
+(1) Create necessary directories
+mkdir -p data log log/cutadapt out/merged out/trimmed out/star res
 
-mkdir -p data log/cutadapt out/merged out/trimmed out/star
-
-# (1) Download sample FASTQ if not present
+(2) Download sample FASTQ files
+echo "Downloading sample FASTQs..."
 while read -r url; do
     file=$(basename "$url")
     if [ -f data/"$file" ]; then
         echo "$file already exists, skipping"
     else
-       wget -P data "$url"
+        wget -P data "$url"
+        # Optional: MD5 check
+        if [ -f "$url.md5" ]; then
+            md5sum -c "$url.md5"
+        fi
     fi
 done < data/urls
 
-# (2) Download contaminants fasta if not present
-contaminants_url="https://masterbioinformatica.com/decont/contaminants.fasta.gz"
+(3) Download contaminants database
+contaminants_url="https://bioinformatics.cnio.es/data/courses/decont/contaminants.fasta.gz"
 if [ ! -f res/contaminants.fasta.gz ]; then
-    wget -P res "$contaminant_url"
+    echo "Downloading contaminants database..."
+    wget -P res "$contaminants_url"
 fi
 
-# (3) Index the contaminnats
+(4) Remove small nuclear RNAs from contaminants (snRNA)
+if [ ! -f res/contaminants.fasta ]; then
+    gunzip -c res/contaminants.fasta.gz | \
+    seqkit grep -v -p "small nuclear" > res/contaminants.fasta
+fi
+
+(5) Index contaminants database using STAR
 bash scripts/index.sh res/contaminants.fasta res/contaminants_idx
 
-# (4) Detect unique sample IDs
+(6) Detect sample IDs automatically
 SAMPLES=$(ls data/*.fastq.gz | sed 's/.*\///' | cut -d- -f1 | sort | uniq)
 echo "Detected samples: $SAMPLES"
 
+(7) Merge technical replicates
 for sid in $SAMPLES; do
     bash scripts/merge_fastqs.sh data out/merged "$sid"
 done
 
-# (5) Execute cutadapt
-logfile=log/pipeline.log
-echo "Pipeline run: $(date)" > "$logfile"
+(8) Initialize pipeline log
+pipeline_log="log/pipeline.log"
+echo "Pipeline run: $(date)" > "$pipeline_log"
 
+(9) Trim adapters with cutadapt
 for sid in $SAMPLES; do
+    trimmed_file="out/trimmed/${sid}.trimmed.fastq.gz"
+    if [ -f "$trimmed_file" ]; then
+        echo "$sid already trimmed, skipping" >> "$pipeline_log"
+        continue
+    fi
+
     cutadapt -m 18 -a TGGAATTCTCGGGTGCCAAGG --discard-untrimmed \
-        -o out/trimmed/${sid}.trimmed.fastq.gz out/merged/${sid}.fastq.gz \
+        -o "$trimmed_file" out/merged/${sid}.fastq.gz \
         > log/cutadapt/${sid}.log
-    echo "Cutadapt summary for $sid" >> "$logfile"
-    grep "Total reads processed" log/cutadapt/${sid}.log >> "$logfile"
-    grep "Reads with adapters" log/cutadapt/${sid}.log >> "$logfile"
+
+    echo "Cutadapt summary for $sid" >> "$pipeline_log"
+    grep "Total reads processed" log/cutadapt/${sid}.log >> "$pipeline_log"
+    grep "Reads with adapters" log/cutadapt/${sid}.log >> "$pipeline_log"
 done
 
-# (6) Execute STAR aligment for eliminating contaminants
-for fname in out/trimmed/*.fastq.gz; do
-    sid=$(basename "$file" .trimmed.fastq.gz)
-    mkdir -p out/star/"$sid"
+(10) STAR alignment to remove contaminant reads
+for trimmed_file in out/trimmed/*.fastq.gz; do
+    sid=$(basename "$trimmed_file" .trimmed.fastq.gz)
+    star_out="out/star/$sid"
+    mkdir -p "$star_out"
+
     STAR --runThreadN 4 --genomeDir res/contaminants_idx \
-        --outReadsUnmapped Fastx --readFilesIn "$fname" \
-        --readFilesCommand gunzip -c \ --outFileNamePrefix out/star/"$sid"/ \
-        > out/star/$sid/STAR.log
-    echo "STAR summary for $sid" >> "$logfile"
-    grep ""Uniquely mapped reads %" out/star/$sid/Log.final.out >> "$logfile"
-    grep "Reads mapped to multiple loci %" out/star/$sid/Log.final.out >> "$logfile"
+        --outReadsUnmapped Fastx --readFilesIn "$trimmed_file" \
+        --readFilesCommand gunzip -c \
+        --outFileNamePrefix "$star_out/" \
+        > "$star_out/STAR.log"
+
+    echo "STAR summary for $sid" >> "$pipeline_log"
+    grep "Uniquely mapped reads %" "$star_out/Log.final.out" >> "$pipeline_log"
+    grep "Reads mapped to multiple loci %" "$star_out/Log.final.out" >> "$pipeline_log"
 done
 
-echo "Pipeline finished successfully!"
+(11) Pipeline finished
+echo "Pipeline finished successfully!" >> "$pipeline_log"
