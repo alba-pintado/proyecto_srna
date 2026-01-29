@@ -1,39 +1,51 @@
-#Download all the files specified in data/filenames
-for url in $(<list_of_urls>) #TODO
-do
-    bash scripts/download.sh $url data
-done
+#!/bin/bash
+set -e  # para que falle si hay algún error
 
-# Download the contaminants fasta file, uncompress it, and
-# filter to remove all small nuclear RNAs
-bash scripts/download.sh <contaminants_url> res yes #TODO
+# 1️⃣ Descargar todos los FASTQs
+while read -r url; do
+    bash scripts/download.sh "$url" data
+done < data/urls
 
-# Index the contaminants file
+# 2️⃣ Descargar el FASTA de contaminantes y filtrarlo si es necesario
+CONTAMINANTS_URL="https://masterbioinformatica.com/decont/contaminants.fasta.gz"
+bash scripts/download.sh "$CONTAMINANTS_URL" res yes
+
+# 3️⃣ Indexar el FASTA de contaminantes
 bash scripts/index.sh res/contaminants.fasta res/contaminants_idx
 
-# Merge the samples into a single file
-for sid in $(<list_of_sample_ids>) #TODO
-do
-    bash scripts/merge_fastqs.sh data out/merged $sid
+# 4️⃣ Obtener IDs de las muestras y mergear los FASTQs técnicos
+SAMPLES=$(ls data/*.fastq.gz | sed 's/.*\///' | cut -d- -f1 | sort | uniq)
+
+for sid in $SAMPLES; do
+    bash scripts/merge_fastqs.sh data out/merged "$sid"
 done
 
-# TODO: run cutadapt for all merged files
-# cutadapt -m 18 -a TGGAATTCTCGGGTGCCAAGG --discard-untrimmed \
-#     -o <trimmed_file> <input_file> > <log_file>
+# 5️⃣ Ejecutar cutadapt para recortar adaptadores
+mkdir -p out/trimmed log/cutadapt
 
-# TODO: run STAR for all trimmed files
-for fname in out/trimmed/*.fastq.gz
-do
-    # you will need to obtain the sample ID from the filename
-    sid=#TODO
-    # mkdir -p out/star/$sid
-    # STAR --runThreadN 4 --genomeDir res/contaminants_idx \
-    #    --outReadsUnmapped Fastx --readFilesIn <input_file> \
-    #    --readFilesCommand gunzip -c --outFileNamePrefix <output_directory>
-done 
+for file in out/merged/*.fastq.gz; do
+    sid=$(basename "$file" .fastq.gz)
+    cutadapt -m 18 -a TGGAATTCTCGGGTGCCAAGG --discard-untrimmed \
+        -o out/trimmed/"$sid".trimmed.fastq.gz "$file" > log/cutadapt/"$sid".log
+done
 
-# TODO: create a log file containing information from cutadapt and star logs
-# (this should be a single log file, and information should be *appended* to it on each run)
-# - cutadapt: Reads with adapters and total basepairs
-# - star: Percentages of uniquely mapped reads, reads mapped to multiple loci, and to too many loci
-# tip: use grep to filter the lines you're interested in
+# 6️⃣ Ejecutar STAR para eliminar contaminantes
+for file in out/trimmed/*.fastq.gz; do
+    sid=$(basename "$file" .trimmed.fastq.gz)
+    mkdir -p out/star/"$sid"
+    STAR --runThreadN 4 --genomeDir res/contaminants_idx \
+        --outReadsUnmapped Fastx --readFilesIn "$file" \
+        --readFilesCommand zcat --outFileNamePrefix out/star/"$sid"/
+done
+
+# 7️⃣ Crear log final
+mkdir -p log
+> log/pipeline.log
+for sid in $SAMPLES; do
+    echo "Sample: $sid" >> log/pipeline.log
+    grep "Reads with adapters" log/cutadapt/"$sid".log >> log/pipeline.log || true
+    grep "Uniquely mapped reads %" out/star/"$sid"/Log.final.out >> log/pipeline.log || true
+    echo "" >> log/pipeline.log
+done
+
+echo "Pipeline finished successfully!"
