@@ -1,51 +1,59 @@
-#!/bin/bash
-set -e  # para que falle si hay algún error
 
-# 1️⃣ Descargar todos los FASTQs
+set -e  
+
+mkdir -p data log/cutadapt out/merged out/trimmed out/star
+
+# (1) Download sample FASTQ if not present
 while read -r url; do
-    bash scripts/download.sh "$url" data
+    file=$(basename "$url")
+    if [ -f data/"$file" ]; then
+        echo "$file already exists, skipping"
+    else
+       wget -P data "$url"
+    fi
 done < data/urls
 
-# 2️⃣ Descargar el FASTA de contaminantes y filtrarlo si es necesario
-CONTAMINANTS_URL="https://masterbioinformatica.com/decont/contaminants.fasta.gz"
-bash scripts/download.sh "$CONTAMINANTS_URL" res yes
+# (2) Download contaminants fasta if not present
+contaminants_url="https://masterbioinformatica.com/decont/contaminants.fasta.gz"
+if [ ! -f res/contaminants.fasta.gz ]; then
+    wget -P res "$contaminant_url"
+fi
 
-# 3️⃣ Indexar el FASTA de contaminantes
+# (3) Index the contaminnats
 bash scripts/index.sh res/contaminants.fasta res/contaminants_idx
 
-# 4️⃣ Obtener IDs de las muestras y mergear los FASTQs técnicos
+# (4) Detect unique sample IDs
 SAMPLES=$(ls data/*.fastq.gz | sed 's/.*\///' | cut -d- -f1 | sort | uniq)
+echo "Detected samples: $SAMPLES"
 
 for sid in $SAMPLES; do
     bash scripts/merge_fastqs.sh data out/merged "$sid"
 done
 
-# 5️⃣ Ejecutar cutadapt para recortar adaptadores
-mkdir -p out/trimmed log/cutadapt
+# (5) Execute cutadapt
+logfile=log/pipeline.log
+echo "Pipeline run: $(date)" > "$logfile"
 
-for file in out/merged/*.fastq.gz; do
-    sid=$(basename "$file" .fastq.gz)
+for sid in $SAMPLES; do
     cutadapt -m 18 -a TGGAATTCTCGGGTGCCAAGG --discard-untrimmed \
-        -o out/trimmed/"$sid".trimmed.fastq.gz "$file" > log/cutadapt/"$sid".log
+        -o out/trimmed/${sid}.trimmed.fastq.gz out/merged/${sid}.fastq.gz \
+        > log/cutadapt/${sid}.log
+    echo "Cutadapt summary for $sid" >> "$logfile"
+    grep "Total reads processed" log/cutadapt/${sid}.log >> "$logfile"
+    grep "Reads with adapters" log/cutadapt/${sid}.log >> "$logfile"
 done
 
-# 6️⃣ Ejecutar STAR para eliminar contaminantes
-for file in out/trimmed/*.fastq.gz; do
+# (6) Execute STAR aligment for eliminating contaminants
+for fname in out/trimmed/*.fastq.gz; do
     sid=$(basename "$file" .trimmed.fastq.gz)
     mkdir -p out/star/"$sid"
     STAR --runThreadN 4 --genomeDir res/contaminants_idx \
-        --outReadsUnmapped Fastx --readFilesIn "$file" \
-        --readFilesCommand zcat --outFileNamePrefix out/star/"$sid"/
-done
-
-# 7️⃣ Crear log final
-mkdir -p log
-> log/pipeline.log
-for sid in $SAMPLES; do
-    echo "Sample: $sid" >> log/pipeline.log
-    grep "Reads with adapters" log/cutadapt/"$sid".log >> log/pipeline.log || true
-    grep "Uniquely mapped reads %" out/star/"$sid"/Log.final.out >> log/pipeline.log || true
-    echo "" >> log/pipeline.log
+        --outReadsUnmapped Fastx --readFilesIn "$fname" \
+        --readFilesCommand gunzip -c \ --outFileNamePrefix out/star/"$sid"/ \
+        > out/star/$sid/STAR.log
+    echo "STAR summary for $sid" >> "$logfile"
+    grep ""Uniquely mapped reads %" out/star/$sid/Log.final.out >> "$logfile"
+    grep "Reads mapped to multiple loci %" out/star/$sid/Log.final.out >> "$logfile"
 done
 
 echo "Pipeline finished successfully!"
